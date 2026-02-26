@@ -2,7 +2,7 @@ name: Weekly Consulting Job Scrape
 
 on:
   schedule:
-    - cron: '0 8 * * 1'
+    - cron: '0 18 * * 5'
   workflow_dispatch:
 
 jobs:
