@@ -37,16 +37,22 @@ jobs:
           path: consulting_job_board_*.xlsx
           retention-days: 30
 
-      - name: Send email notification (optional)
-        if: env.SEND_EMAIL == 'true'
+      - name: Send email with job board
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Weekly Consulting Job Board"
-          to: ${{ secrets.EMAIL_TO }}
-          from: MBB Prep Bot
-          body: "Your weekly consulting job board is attached."
+          subject: "Weekly Consulting Job Board - ${{ github.run_number }}"
+          to: ashwin4295@gmail.com, khushivanshkar95@gmail.com
+          from: MBB Prep Bot <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            Hi,
+
+            Your weekly consulting job board Excel is attached.
+
+            This was generated automatically on ${{ github.event.repository.updated_at }}.
+
+            - MBB Prep Bot
           attachments: consulting_job_board_*.xlsx
