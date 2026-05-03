@@ -8,9 +8,10 @@ Requirements: playwright, openpyxl
 Install: pip install playwright openpyxl && playwright install chromium
 """
 
-import re, json, time, os
-from datetime import date, datetime
+import time, os
+from datetime import date
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -72,97 +73,134 @@ COMPANY_WEBSITES = {
 }
 
 
-def scrape_jboard_site(page, site_url, site_name):
-    print(f"\nScraping {site_name}: {site_url}")
-    page.goto(site_url, wait_until="networkidle", timeout=60000)
-    time.sleep(3)
+CARD_EXTRACTOR_JS = r"""
+() => {
+    const JOB_TYPE_ALIASES = new Set([
+        'full-time','part-time','contract','contractor','internship',
+        'intern','temporary','freelance','permanent','fixed-term'
+    ]);
+    const CATEGORY_ALIASES = new Set([
+        'experienced-hires','entry-level','internship-students','mba-graduates',
+        'undergraduates','phd','associates','senior-associates','principals','partners',
+        'consultants','analysts','managers'
+    ]);
+    const cards = document.querySelectorAll('.job-listings-item');
+    const out = [];
+    for (const card of cards) {
+        const jobId = card.getAttribute('data-jobid') || card.getAttribute('data-jobId') || '';
+        if (!jobId) continue;
 
-    prev_count = 0
-    stale_rounds = 0
-    while stale_rounds < 5:
-        count = page.evaluate("document.querySelectorAll('a[href*=/jobs/]').length")
-        if count == prev_count:
-            stale_rounds += 1
-        else:
-            stale_rounds = 0
-            prev_count = count
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1.5)
+        const titleEl = card.querySelector('h3');
+        const title = titleEl ? titleEl.innerText.trim() : '';
 
-    print(f"Found ~{prev_count} job elements on page")
+        const titleLink = card.querySelector('a.job-details-link');
+        const slug = titleLink ? (titleLink.getAttribute('href') || '') : '';
 
-    jobs = page.evaluate("""() => {
-        const jobs = [];
-        const seen = new Set();
-        const jobLinks = document.querySelectorAll('a[href*="/jobs/"]');
-        for (const link of jobLinks) {
-            const href = link.getAttribute('href') || '';
-            const match = href.match(/\\/jobs\\/(\\d+)/);
-            if (!match) continue;
-            const jobId = match[1];
-            if (seen.has(jobId) || jobId.length < 6) continue;
-            seen.add(jobId);
-            const card = link.closest('[class*=job], [class*=Job], li, article, div') || link;
-            const text = card.innerText || '';
-            const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
-            const title = lines[0] || '';
-            const company = lines[1] || '';
-            let location = '', jobType = '', category = '';
-            for (const line of lines.slice(2)) {
-                if (/full.time|part.time|contract|internship/i.test(line) && !jobType) jobType = line;
-                else if (/,/.test(line) && /(US|CA|GB|DE|FR|AU|IN|SG|AE|NL|CH|BR|MX|JP|KR|ES|IT|PT|BE|SE|PL|RO|HU|AT)$/i.test(line.split(',').pop().trim())) location = line;
-                else if (/consulting|strategy|advisory|corporate/i.test(line) && !category) category = line;
+        const companyEl = card.querySelector('a[href^="/companies/"]');
+        const company = companyEl ? companyEl.innerText.trim() : '';
+
+        let jobType = '', category = '', location = '';
+
+        // Filter links use stable URL prefixes on the Jboard platform — safe to scan card-wide.
+        const filterLinks = card.querySelectorAll('a[href^="/jobs/"]');
+        for (const a of filterLinks) {
+            const href = a.getAttribute('href') || '';
+            // Skip detail-page links like /jobs/123456-... and /jobs/123456/apply
+            if (/^\/jobs\/\d/.test(href)) continue;
+            const text = (a.innerText || '').trim();
+            if (href.startsWith('/jobs/in-')) {
+                if (!location) location = text;
+            } else {
+                const alias = href.replace(/^\/jobs\//, '').replace(/\/$/, '').toLowerCase();
+                if (JOB_TYPE_ALIASES.has(alias) && !jobType) jobType = text;
+                else if (CATEGORY_ALIASES.has(alias) && !category) category = text;
             }
-            if (title && title.length > 3) jobs.push({title, company, jobType, category, location, jobId});
         }
-        return jobs;
-    }""")
 
-    print(f"Extracted {len(jobs)} jobs from {site_name}")
-    return jobs
+        // Span fallback for the free-text location (some MCO cards render it as a span,
+        // not an /jobs/in-... filter link). Scoped to the meta row to keep salary chips
+        // and other card text from leaking in.
+        if (!location) {
+            const metaRow = companyEl ? companyEl.closest('div.d-flex') : null;
+            const spans = (metaRow || card).querySelectorAll('span');
+            for (const s of spans) {
+                if (s.querySelector('a')) continue;
+                const t = (s.innerText || '').trim();
+                if (!t || t === '•') continue;
+                if (/^\d+\s*(min|h|d|w|mo|y)\s*ago$/i.test(t)) continue;
+                location = t;
+                break;
+            }
+        }
+
+        if (title) out.push({ title, company, jobType, category, location, jobId, slug });
+    }
+    return out;
+}
+"""
 
 
-def scrape_jboard_api(page, base_url):
-    print(f"Attempting API-based extraction from {base_url}...")
+def scrape_jboard_site(page, base_url, site_name):
+    print(f"\nScraping {site_name}: {base_url}")
     all_jobs = []
-    api_responses = []
+    seen_ids = set()
+    page_num = 1
+    max_pages = 100  # safety cap
 
-    def handle_response(response):
-        if 'jboard-api' in response.url or '/api/' in response.url:
+    while page_num <= max_pages:
+        url = base_url if page_num == 1 else f"{base_url}?page={page_num}"
+        print(f"  Page {page_num}: {url}")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"  goto failed: {e}; retrying with networkidle...")
+            page.goto(url, wait_until="networkidle", timeout=60000)
+
+        loaded = False
+        for attempt in range(3):
             try:
-                data = response.json()
-                if isinstance(data, list): api_responses.extend(data)
-                elif isinstance(data, dict) and 'data' in data: api_responses.extend(data['data'])
-            except: pass
+                page.wait_for_selector(".job-listings-item", timeout=20000)
+                loaded = True
+                break
+            except Exception:
+                title = page.title()
+                if "moment" in title.lower() or "challenge" in title.lower():
+                    print(f"  Cloudflare challenge detected (title={title!r}), waiting and retrying...")
+                    time.sleep(8)
+                    continue
+                break
+        if not loaded:
+            print("  No .job-listings-item on page after retries -- stopping.")
+            break
 
-    page.on("response", handle_response)
-    page.goto(base_url, wait_until="networkidle", timeout=60000)
-    for _ in range(50):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(1)
-    page.remove_listener("response", handle_response)
+        jobs = page.evaluate(CARD_EXTRACTOR_JS)
+        new_count = 0
+        for j in jobs:
+            jid = j.get("jobId", "")
+            if jid and jid not in seen_ids:
+                seen_ids.add(jid)
+                all_jobs.append(j)
+                new_count += 1
+        print(f"    extracted {len(jobs)} cards ({new_count} new), total so far: {len(all_jobs)}")
 
-    if api_responses:
-        print(f"Captured {len(api_responses)} jobs via API")
-        for item in api_responses:
-            if isinstance(item, dict) and 'title' in item:
-                all_jobs.append({
-                    'title': item.get('title', ''),
-                    'company': item.get('company_name', item.get('company', '')),
-                    'jobType': item.get('employment_type', item.get('type', '')),
-                    'category': item.get('category', ''),
-                    'location': item.get('location', ''),
-                    'jobId': str(item.get('id', item.get('slug', ''))),
-                })
+        next_href = page.evaluate(
+            "(()=>{const l=document.querySelector('link[rel=next]');return l?l.getAttribute('href'):null})()"
+        )
+        if not next_href:
+            print("  No rel=next link — done.")
+            break
+        if new_count == 0:
+            print("  No new jobs on this page — stopping to avoid loop.")
+            break
+        page_num += 1
+
+    print(f"Extracted {len(all_jobs)} unique jobs from {site_name}")
     return all_jobs
 
 
 def scrape_site(page, site_url, site_name):
-    jobs = scrape_jboard_site(page, site_url, site_name)
-    if len(jobs) > 50: return jobs
-    print(f"DOM scraping got only {len(jobs)} jobs, trying API approach...")
-    api_jobs = scrape_jboard_api(page, site_url)
-    return api_jobs if len(api_jobs) > len(jobs) else jobs
+    return scrape_jboard_site(page, site_url, site_name)
 
 
 def build_excel(all_jobs, output_path):
@@ -261,11 +299,22 @@ def main():
     all_jobs = []
     seen_ids = set()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+    with Stealth().use_sync(sync_playwright()) as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            },
         )
 
         page_mco = context.new_page()
