@@ -75,65 +75,38 @@ COMPANY_WEBSITES = {
 
 CARD_EXTRACTOR_JS = r"""
 () => {
-    const JOB_TYPE_ALIASES = new Set([
-        'full-time','part-time','contract','contractor','internship',
-        'intern','temporary','freelance','permanent','fixed-term'
-    ]);
-    const CATEGORY_ALIASES = new Set([
-        'experienced-hires','entry-level','internship-students','mba-graduates',
-        'undergraduates','phd','associates','senior-associates','principals','partners',
-        'consultants','analysts','managers'
-    ]);
-    const cards = document.querySelectorAll('.job-listings-item');
+    // Each Jboard listing page exposes the full job payload as window.jobsList.
+    // This is the source of truth — including apply_by/apply_to, which give us
+    // the real employer ATS URL when the employer chose external-link applies.
+    const list = Array.isArray(window.jobsList) ? window.jobsList : [];
+    const tenantHost = location.host;
     const out = [];
-    for (const card of cards) {
-        const jobId = card.getAttribute('data-jobid') || card.getAttribute('data-jobId') || '';
-        if (!jobId) continue;
+    for (const j of list) {
+        if (!j || !j.id || !j.title) continue;
 
-        const titleEl = card.querySelector('h3');
-        const title = titleEl ? titleEl.innerText.trim() : '';
-
-        const titleLink = card.querySelector('a.job-details-link');
-        const slug = titleLink ? (titleLink.getAttribute('href') || '') : '';
-
-        const companyEl = card.querySelector('a[href^="/companies/"]');
-        const company = companyEl ? companyEl.innerText.trim() : '';
-
-        let jobType = '', category = '', location = '';
-
-        // Filter links use stable URL prefixes on the Jboard platform — safe to scan card-wide.
-        const filterLinks = card.querySelectorAll('a[href^="/jobs/"]');
-        for (const a of filterLinks) {
-            const href = a.getAttribute('href') || '';
-            // Skip detail-page links like /jobs/123456-... and /jobs/123456/apply
-            if (/^\/jobs\/\d/.test(href)) continue;
-            const text = (a.innerText || '').trim();
-            if (href.startsWith('/jobs/in-')) {
-                if (!location) location = text;
-            } else {
-                const alias = href.replace(/^\/jobs\//, '').replace(/\/$/, '').toLowerCase();
-                if (JOB_TYPE_ALIASES.has(alias) && !jobType) jobType = text;
-                else if (CATEGORY_ALIASES.has(alias) && !category) category = text;
-            }
+        // Only treat apply_to as a real external link when the employer opted into
+        // by-link applies AND the URL leaves the Jboard tenant. Anything else
+        // (in-board form, email, missing URL, or Jboard-hosted URL) is dropped.
+        let applyLink = '';
+        if (j.apply_by === 'by_link' && typeof j.apply_to === 'string' && j.apply_to) {
+            try {
+                const u = new URL(j.apply_to);
+                if (u.host && u.host !== tenantHost && !/jboard\.io$/.test(u.host)) {
+                    applyLink = j.apply_to;
+                }
+            } catch (e) { /* malformed URL, skip */ }
         }
 
-        // Span fallback for the free-text location (some MCO cards render it as a span,
-        // not an /jobs/in-... filter link). Scoped to the meta row to keep salary chips
-        // and other card text from leaking in.
-        if (!location) {
-            const metaRow = companyEl ? companyEl.closest('div.d-flex') : null;
-            const spans = (metaRow || card).querySelectorAll('span');
-            for (const s of spans) {
-                if (s.querySelector('a')) continue;
-                const t = (s.innerText || '').trim();
-                if (!t || t === '•') continue;
-                if (/^\d+\s*(min|h|d|w|mo|y)\s*ago$/i.test(t)) continue;
-                location = t;
-                break;
-            }
-        }
-
-        if (title) out.push({ title, company, jobType, category, location, jobId, slug });
+        out.push({
+            jobId: String(j.id),
+            title: j.title || '',
+            company: (j.employer && j.employer.name) || '',
+            location: j.location || '',
+            jobType: (j.job_type && j.job_type.name) || '',
+            category: (j.category && j.category.name) || '',
+            slug: j.job_details_path || '',
+            applyLink,
+        });
     }
     return out;
 }
@@ -317,27 +290,19 @@ def main():
             },
         )
 
-        page_mco = context.new_page()
-        mco_jobs = scrape_site(page_mco, MCO_URL, "MyConsultingOffer")
-        for j in mco_jobs:
-            jid = j.get('jobId', '')
-            if jid and jid not in seen_ids:
-                seen_ids.add(jid)
-                j['website'] = COMPANY_WEBSITES.get(j['company'], '')
-                j['applyLink'] = f"https://jobs.myconsultingoffer.org/jobs/{jid}/apply"
-                all_jobs.append(j)
-        page_mco.close()
-
-        page_mc = context.new_page()
-        mc_jobs = scrape_site(page_mc, MC_URL, "Management Consulted")
-        for j in mc_jobs:
-            jid = j.get('jobId', '')
-            if jid and jid not in seen_ids:
-                seen_ids.add(jid)
-                j['website'] = COMPANY_WEBSITES.get(j['company'], '')
-                j['applyLink'] = f"https://jobs.managementconsulted.com/jobs/{jid}/apply"
-                all_jobs.append(j)
-        page_mc.close()
+        for board_url, board_name in [(MCO_URL, "MyConsultingOffer"), (MC_URL, "Management Consulted")]:
+            board_page = context.new_page()
+            jobs = scrape_site(board_page, board_url, board_name)
+            for j in jobs:
+                jid = j.get('jobId', '')
+                if jid and jid not in seen_ids:
+                    seen_ids.add(jid)
+                    j['website'] = COMPANY_WEBSITES.get(j['company'], '')
+                    # j['applyLink'] is already set by the extractor — it is either
+                    # the real employer ATS URL (apply_by=by_link, off-tenant) or ''.
+                    # Never substitute the board's own /apply URL: that's a competitor.
+                    all_jobs.append(j)
+            board_page.close()
         browser.close()
 
     print(f"\nTotal unique jobs: {len(all_jobs)}")
