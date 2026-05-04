@@ -8,8 +8,11 @@ Requirements: playwright, openpyxl
 Install: pip install playwright openpyxl && playwright install chromium
 """
 
-import time, os
+import time, os, concurrent.futures
 from datetime import date
+from urllib.parse import urlparse, parse_qs, unquote
+import requests
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 from openpyxl import Workbook
@@ -71,6 +74,176 @@ COMPANY_WEBSITES = {
     'Clarkston Consulting': 'https://clarkstonconsulting.com',
     'North Highland': 'https://www.northhighland.com',
 }
+
+
+# Firm-specific careers landing pages, used as a fallback when a job has no
+# external apply URL on the source board. Only firms with a known, stable
+# careers URL are listed here; anything else gets a blank apply cell.
+FIRM_CAREERS = {
+    'McKinsey & Company': 'https://www.mckinsey.com/careers/search-jobs',
+    'Boston Consulting Group (BCG)': 'https://careers.bcg.com',
+    'Boston Consulting Group': 'https://careers.bcg.com',
+    'Bain & Company': 'https://www.bain.com/careers/find-a-role/',
+    'Roland Berger': 'https://www.rolandberger.com/en/Careers/',
+    'Oliver Wyman': 'https://www.oliverwyman.com/careers.html',
+    'Alvarez & Marsal': 'https://careers.alvarezandmarsal.com',
+    'Alvarez and Marsal': 'https://careers.alvarezandmarsal.com',
+    'EY': 'https://careers.ey.com',
+    'EY-Parthenon': 'https://careers.ey.com',
+    'Deloitte': 'https://apply.deloitte.com',
+    'KPMG UK': 'https://www.kpmgcareers.co.uk',
+    'KPMG Canada': 'https://kpmg.com/ca/en/home/careers.html',
+    'KPMG US': 'https://www.kpmgus.com/careers.html',
+    'PwC': 'https://jobs.us.pwc.com',
+    'PwC Canada': 'https://www.pwc.com/ca/en/careers.html',
+    'Accenture': 'https://www.accenture.com/us-en/careers',
+    'Capital One': 'https://www.capitalonecareers.com',
+    'Google': 'https://careers.google.com/jobs/results/',
+    'Guidehouse': 'https://guidehouse.wd1.myworkdayjobs.com/External',
+    'Huron': 'https://huron.wd1.myworkdayjobs.com/HuronCareers',
+    'Simon-Kucher': 'https://www.simon-kucher.com/en/careers',
+    'FTI Consulting': 'https://www.fticonsulting.com/careers',
+    'Booz Allen Hamilton': 'https://www.boozallen.com/careers.html',
+    'L.E.K. Consulting': 'https://www.lek.com/careers',
+    'Kearney': 'https://www.kearney.com/careers',
+    'AlixPartners': 'https://www.alixpartners.com/careers/',
+    'Infosys': 'https://www.infosys.com/careers/',
+    'Cognizant': 'https://careers.cognizant.com',
+    'IQVIA': 'https://jobs.iqvia.com',
+    'Visa': 'https://corporate.visa.com/en/jobs.html',
+    'The Walt Disney Company': 'https://jobs.disneycareers.com',
+    'American Express': 'https://www.americanexpress.com/en-us/careers',
+    'Ford Motor Company': 'https://corporate.ford.com/careers.html',
+    'General Motors': 'https://search-careers.gm.com',
+    'Pfizer': 'https://www.pfizer.com/about/careers',
+    'The Carlyle Group': 'https://www.carlyle.com/careers',
+    'RBC': 'https://jobs.rbc.com',
+    'Trinity Life Sciences': 'https://trinitylifesciences.com/careers/',
+    'Mercer': 'https://careers.marshmclennan.com',
+    'West Monroe': 'https://www.westmonroe.com/careers',
+    'Stax': 'https://www.stax.com/careers',
+    'Porsche Consulting': 'https://www.porsche-consulting.com/en/career',
+    'RSM Canada': 'https://rsmcanada.com/careers.html',
+    'The Coca-Cola Company': 'https://careers.coca-colacompany.com',
+    'Kantar': 'https://www.kantar.com/careers',
+    'ClearView Healthcare Partners': 'https://www.clearviewhcp.com/careers',
+    'Clarkston Consulting': 'https://clarkstonconsulting.com/careers/',
+    'North Highland': 'https://www.northhighland.com/careers',
+    'Teneo': 'https://www.teneo.com/careers/',
+    'Synpulse': 'https://www.synpulse.com/en/careers',
+    'PA Consulting': 'https://www.paconsulting.com/careers',
+    'TPG': 'https://www.tpg.com/careers',
+}
+
+
+_DDG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _ddg_search(query, max_results=5, timeout=10):
+    """Hit DuckDuckGo's HTML interface and return result URLs in rank order."""
+    try:
+        resp = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers=_DDG_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+    except Exception:
+        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
+    out = []
+    for a in soup.select("a.result__a"):
+        href = a.get("href", "")
+        if not href:
+            continue
+        # DDG wraps results as /l/?uddg=<encoded-url>
+        if href.startswith("//duckduckgo.com/l/") or href.startswith("/l/"):
+            wrapped = "https:" + href if href.startswith("//") else "https://duckduckgo.com" + href
+            uddg = parse_qs(urlparse(wrapped).query).get("uddg", [""])[0]
+            if uddg:
+                href = unquote(uddg)
+        if href.startswith("http"):
+            out.append(href)
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def find_firm_apply_url(company, title):
+    """Return a firm-specific apply URL for a job that has no external apply URL.
+
+    Strategy:
+      1. Look up the firm's careers landing page in FIRM_CAREERS. If we don't
+         have a stable URL for this firm, give up — better blank than wrong.
+      2. Search DuckDuckGo constrained to that careers domain for the specific
+         job title; if a match comes back, return it.
+      3. Otherwise return the firm's general careers URL.
+    """
+    careers_url = FIRM_CAREERS.get(company or "")
+    if not careers_url:
+        return ""
+    domain = urlparse(careers_url).netloc
+    if domain:
+        try:
+            results = _ddg_search(
+                f'"{title}" "{company}" site:{domain}', max_results=5, timeout=10
+            )
+            for r in results:
+                if domain in urlparse(r).netloc:
+                    return r
+        except Exception:
+            pass
+    return careers_url
+
+
+def enrich_blank_apply_links(jobs, max_searches=200, max_workers=8):
+    """For jobs with no applyLink, fill in a firm-specific careers link.
+
+    Specific job URLs (via search) are tried first, capped at `max_searches`
+    to keep the weekly cron fast and avoid DDG rate limiting. Beyond that cap,
+    we fall straight to the firm's general careers URL with no search.
+    """
+    blanks = [j for j in jobs if not j.get("applyLink")]
+    if not blanks:
+        return 0
+
+    print(f"\nEnriching {len(blanks)} jobs without external apply URL...")
+
+    # Cache by (company, title) so duplicate roles don't search twice.
+    cache = {}
+    searchable = blanks[:max_searches]
+    direct = blanks[max_searches:]
+
+    def resolve(job):
+        key = (job.get("company", ""), job.get("title", ""))
+        if key in cache:
+            return job, cache[key]
+        url = find_firm_apply_url(job.get("company", ""), job.get("title", ""))
+        cache[key] = url
+        return job, url
+
+    filled = 0
+    if searchable:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for job, url in ex.map(resolve, searchable):
+                if url:
+                    job["applyLink"] = url
+                    filled += 1
+    for job in direct:
+        # Skip the search, just use the firm careers page if known.
+        url = FIRM_CAREERS.get(job.get("company", ""), "")
+        if url:
+            job["applyLink"] = url
+            filled += 1
+    print(f"  filled {filled}/{len(blanks)} blanks")
+    return filled
 
 
 CARD_EXTRACTOR_JS = r"""
@@ -304,6 +477,12 @@ def main():
                     all_jobs.append(j)
             board_page.close()
         browser.close()
+
+    # For any remaining blank applyLinks, fall back to a firm-specific URL:
+    # specific job posting on the firm's careers site if findable, else the
+    # firm's general careers landing page. Still leaves blanks empty when the
+    # firm isn't in FIRM_CAREERS.
+    enrich_blank_apply_links(all_jobs)
 
     print(f"\nTotal unique jobs: {len(all_jobs)}")
     if all_jobs:
